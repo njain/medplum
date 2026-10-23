@@ -30,8 +30,9 @@ export interface StrideForwardHost {
   readonly sendOutcome: typeof sendOutcome;
   /**
    * Runs `callback` in one transaction on `repo` (FHIR writes through the transaction-scoped repository, module SQL
-   * through its `getDatabaseClient`). A raw Postgres error from module SQL is logged and replaced by a generic
-   * OperationOutcomeError before Medplum wraps it, so database messages never reach the client.
+   * through its `getDatabaseClient`). Deferred constraints are checked before the callback returns, and a raw Postgres
+   * error from module SQL is replaced by a generic OperationOutcomeError before Medplum wraps it, so database messages
+   * never reach the client. Modules must not register pre-commit callbacks on `tx`.
    */
   readonly withTransaction: <T>(repo: Repository, callback: (tx: Repository) => Promise<T>, options: TransactionSqlOptions) => Promise<T>;
   /** Call per use: inside a request it returns the logger carrying that request's project, request and trace ids. */
@@ -68,8 +69,9 @@ export async function registerStrideForwardModules(apiRouter: Router): Promise<v
 
 /**
  * Every error a module route throws or rejects with leaves as an OperationOutcome (architecture standards §2.5).
- * Intentional outcomes (OperationOutcomeError) pass through unchanged; anything else is logged with the request's
- * context and returned as a generic server error, so internal messages never reach the client.
+ * Intentional outcomes (OperationOutcomeError) pass through unchanged; anything else is logged (type and request
+ * context only, never the message) and returned as a generic server error, so internal messages never reach the
+ * client or the logs.
  * @param name - The module name, for the log entry.
  * @returns Express error middleware for the module's router.
  */
@@ -83,7 +85,8 @@ function moduleErrorBoundary(name: string) {
       sendOutcome(res, err.outcome);
       return;
     }
-    getLogger().error('StrideForward module error', { module: name, error: err instanceof Error ? err.message : String(err) });
+    // Log the error's type only: messages can carry PHI (security §9). The request ids come from the request logger.
+    getLogger().error('StrideForward module error', { module: name, errorType: err instanceof Error ? err.name : typeof err });
     sendOutcome(res, medplumCore.serverError(new Error('Internal server error')));
   };
 }
@@ -91,8 +94,9 @@ function moduleErrorBoundary(name: string) {
 /**
  * Repository.withTransaction for modules. Medplum's normalizeDatabaseError copies a Postgres error's message into
  * the OperationOutcome it returns and does not keep the original error, so raw database errors from module SQL are
- * replaced here, inside the transaction, before Medplum sees them: 409 for a serialization failure or duplicate key
- * (the client may retry), 500 otherwise. The transaction still rolls back because the callback still throws.
+ * replaced here, inside the transaction, before Medplum sees them. A serialization failure becomes a conflict that keeps
+ * its 40001 coding, so Medplum retries the transaction; a duplicate key becomes a 409; anything else a 500. The
+ * transaction still rolls back because the callback still throws. Only the SQLSTATE is logged.
  * @param repo - The caller's repository (ctx.repo).
  * @param callback - The transactional work.
  * @param options - Medplum transaction options (resource types, source label).
@@ -105,20 +109,25 @@ async function moduleTransaction<T>(
 ): Promise<T> {
   return repo.withTransaction(async (tx) => {
     try {
-      return await callback(tx);
+      const result = await callback(tx);
+      // Check deferred constraints now, inside this catch, instead of at COMMIT (where Medplum would wrap the error
+      // with its database message). Afterwards only Medplum's own commit work remains.
+      await tx.getDatabaseClient(repoAccess.sqlWrite([], { source: 'sf-hook.checkDeferred' })).query('SET CONSTRAINTS ALL IMMEDIATE');
+      return result;
     } catch (err) {
       const sqlState = postgresErrorCode(err);
       if (!sqlState) {
         throw err;
       }
-      getLogger().error('StrideForward module database error', {
-        source: options.source,
-        sqlState,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      // Log the SQLSTATE and the call site only: Postgres messages can repeat input values (PHI).
+      getLogger().error('StrideForward module database error', { source: options.source, sqlState });
+      if (sqlState === '40001') {
+        // Keep the SQLSTATE coding so Medplum's isRetryableTransactionError retries the whole transaction.
+        throw new medplumCore.OperationOutcomeError(medplumCore.conflict('Concurrent update; retrying', sqlState));
+      }
       throw new medplumCore.OperationOutcomeError(
-        sqlState === '40001' || sqlState === '23505'
-          ? medplumCore.conflict('The record changed or already exists; retry the request')
+        sqlState === '23505'
+          ? medplumCore.conflict('The record already exists')
           : medplumCore.serverError(new Error('Internal server error'))
       );
     }
