@@ -56,6 +56,7 @@ import { closeRateLimiter, rateLimitHandler } from './ratelimit';
 import { closeRedis, initRedis } from './redis';
 import { scimRouter } from './scim/routes';
 import { seedDatabase } from './seed';
+import { registerStrideForwardModules } from './sf-hook';
 import { initServerRegistryHeartbeatListener } from './server-registry';
 import { initBinaryStorage } from './storage/loader';
 import { storageRouter } from './storage/routes';
@@ -275,6 +276,9 @@ export async function initApp(app: Express, config: ServerConfig): Promise<http.
   if (config.mcpEnabled) {
     apiRouter.use('/mcp', mcpRouter);
   }
+
+  // StrideForward: the single registration hook (see sf-hook.ts).
+  await registerStrideForwardModules(apiRouter);
 
   app.use('/api/projects/:projectId/', apiRouter);
   app.use('/projects/:projectId/', apiRouter);
