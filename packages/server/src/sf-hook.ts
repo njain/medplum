@@ -112,7 +112,10 @@ async function moduleTransaction<T>(
       const result = await callback(tx);
       // Check deferred constraints now, inside this catch, instead of at COMMIT (where Medplum would wrap the error
       // with its database message). Afterwards only Medplum's own commit work remains.
-      await tx.getDatabaseClient(repoAccess.sqlWrite([], { source: 'sf-hook.checkDeferred' })).query('SET CONSTRAINTS ALL IMMEDIATE');
+      // Uses the transaction's own resource types: Medplum routes every SQL call to a shard by them.
+      await tx
+        .getDatabaseClient(repoAccess.sqlWrite(options.resourceTypes, { source: 'sf-hook.checkDeferred' }))
+        .query('SET CONSTRAINTS ALL IMMEDIATE');
       return result;
     } catch (err) {
       const sqlState = postgresErrorCode(err);
