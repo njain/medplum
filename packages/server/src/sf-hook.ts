@@ -9,16 +9,40 @@
 // SF_MODULES is a comma-separated list of module entry files (absolute paths). Each exports
 // `register(host: StrideForwardHost): Promise<void> | void`. With SF_MODULES unset this hook does nothing.
 import * as medplumCore from '@medplum/core';
+import type { Project } from '@medplum/fhirtypes';
+import { Queue, Worker } from 'bullmq';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { Router as createRouter } from 'express';
+import { getConfig } from './config/loader';
 import { getAuthenticatedContext } from './context';
 import { DatabaseMode, getDatabasePool } from './database';
 import { sendOutcome } from './fhir/outcomes';
 import type { TransactionSqlOptions } from './fhir/repository/access-tracker';
 import { repoAccess } from './fhir/repository/access-tracker';
-import type { Repository } from './fhir/repo';
+import { getGlobalSystemRepo, Repository } from './fhir/repo';
+import { PLACEHOLDER_SHARD_ID } from './fhir/sharding';
 import { getLogger } from './logger';
 import { authenticateRequest } from './oauth/middleware';
+import { defaultQueueOptions, queueRegistry } from './workers/utils';
+
+/** A module's background job queue: `add` from any node; the handler runs on nodes whose workers are enabled. */
+export interface StrideForwardQueue {
+  add(data: Record<string, unknown>, options?: { jobId?: string; delayMs?: number }): Promise<void>;
+}
+
+export interface StrideForwardJobs {
+  /**
+   * Registers a queue named `sf-<module>-<job>` on Medplum's BullMQ connection and in its queue registry (closed on
+   * shutdown). Its worker runs where MEDPLUM_WORKERS_ENABLED includes the queue name or '*' (sf-jobs), never on
+   * request nodes configured with an empty list. `everyMs` adds one repeating job under a stable scheduler id. The
+   * handler receives the job data only and re-establishes any tenant context from it.
+   */
+  register(
+    name: string,
+    handler: (data: Record<string, unknown>) => Promise<void>,
+    options?: { everyMs?: number }
+  ): StrideForwardQueue;
+}
 
 export interface StrideForwardHost {
   /** Mounted at /sf/<name>/; every request is already authenticated by Medplum's own middleware. */
@@ -38,6 +62,69 @@ export interface StrideForwardHost {
   /** Call per use: inside a request it returns the logger carrying that request's project, request and trace ids. */
   readonly getLogger: typeof getLogger;
   readonly core: typeof medplumCore;
+  /** Background jobs on Medplum's worker framework. */
+  readonly jobs: StrideForwardJobs;
+  /**
+   * A repository with full access inside one project only (project admin, no access policy), for jobs that must write
+   * FHIR (Tasks for rejected charges or unpriced visits). Medplum's own project system repository is not limited to the
+   * project; this one reads and writes nothing outside it. Fails for a project that does not exist.
+   */
+  readonly systemRepo: (projectId: string) => Promise<Repository>;
+}
+
+const QUEUE_NAME = /^sf-[a-z0-9]+(-[a-z0-9]+)*$/;
+
+const jobs: StrideForwardJobs = {
+  register(name, handler, options) {
+    if (!QUEUE_NAME.test(name)) {
+      throw new Error(`StrideForward queue names must look like sf-<module>-<job>: ${name}`);
+    }
+    if (queueRegistry.get(name)) {
+      throw new Error(`StrideForward queue ${name} is already registered`);
+    }
+    const config = getConfig();
+    const queueOptions = defaultQueueOptions(config);
+    const queue = new Queue(name, queueOptions);
+    const enabled = config.workers?.enabled;
+    const workerEnabled = enabled === undefined || enabled.includes('*') || (enabled as string[]).includes(name);
+    const worker = workerEnabled
+      ? new Worker(
+          name,
+          async (job: { data: Record<string, unknown> }) => {
+            await handler(job.data);
+          },
+          { ...queueOptions }
+        )
+      : undefined;
+    queueRegistry.add(name, queue, worker);
+    if (options?.everyMs !== undefined) {
+      if (!Number.isSafeInteger(options.everyMs) || options.everyMs < 1000) {
+        throw new Error('everyMs must be a whole number of milliseconds, at least 1000');
+      }
+      queue.upsertJobScheduler(`${name}:every`, { every: options.everyMs }, { name, data: {} }).catch((err: unknown) => {
+        getLogger().error('StrideForward job scheduler error', { queue: name, errorType: err instanceof Error ? err.name : typeof err });
+      });
+    }
+    return {
+      async add(data, addOptions) {
+        await queue.add(name, data, { jobId: addOptions?.jobId, delay: addOptions?.delayMs });
+      },
+    };
+  },
+};
+
+async function projectSystemRepo(projectId: string): Promise<Repository> {
+  const project = await getGlobalSystemRepo().readResource<Project>('Project', projectId);
+  return new Repository({
+    routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
+    projects: [project],
+    author: { reference: 'system' },
+    superAdmin: false,
+    projectAdmin: true,
+    strictMode: true,
+    extendedMode: true,
+    checkReferencesOnWrite: project.checkReferencesOnWrite,
+  });
 }
 
 export async function registerStrideForwardModules(apiRouter: Router): Promise<void> {
@@ -60,6 +147,8 @@ export async function registerStrideForwardModules(apiRouter: Router): Promise<v
       withTransaction: moduleTransaction,
       getLogger,
       core: medplumCore,
+      jobs,
+      systemRepo: projectSystemRepo,
     });
     router.use(moduleErrorBoundary(name));
     apiRouter.use(`/sf/${name}/`, router);
@@ -95,7 +184,8 @@ function moduleErrorBoundary(name: string) {
  * Repository.withTransaction for modules. Medplum's normalizeDatabaseError copies a Postgres error's message into
  * the OperationOutcome it returns and does not keep the original error, so raw database errors from module SQL are
  * replaced here, inside the transaction, before Medplum sees them. A serialization failure becomes a conflict that keeps
- * its 40001 coding, so Medplum retries the transaction; a duplicate key becomes a 409; anything else a 500. The
+ * its 40001 coding, so Medplum retries the transaction; a duplicate key becomes a 409; a row-security or privilege
+ * refusal (42501) a 403; anything else a 500. The
  * transaction still rolls back because the callback still throws. Only the SQLSTATE is logged.
  * @param repo - The caller's repository (ctx.repo).
  * @param callback - The transactional work.
@@ -127,6 +217,10 @@ async function moduleTransaction<T>(
       if (sqlState === '40001') {
         // Keep the SQLSTATE coding so Medplum's isRetryableTransactionError retries the whole transaction.
         throw new medplumCore.OperationOutcomeError(medplumCore.conflict('Concurrent update; retrying', sqlState));
+      }
+      if (sqlState === '42501') {
+        // A row-security or privilege refusal: the caller may not touch that row (multi-tenancy doc 12 §3).
+        throw new medplumCore.OperationOutcomeError(medplumCore.forbidden);
       }
       throw new medplumCore.OperationOutcomeError(
         sqlState === '23505'
