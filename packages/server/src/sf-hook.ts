@@ -86,6 +86,10 @@ export interface StrideForwardHost {
 
 const QUEUE_NAME = /^sf-[a-z0-9]+(-[a-z0-9]+)*$/;
 const ENTERPRISE_ID = /^[A-Za-z0-9-]{1,64}$/;
+/** A caller's job id: no ':' (BullMQ refuses it) and no '_' run that could be mistaken for the separator. */
+const JOB_ID = /^[A-Za-z0-9.-]{1,128}$/;
+/** Separates enterprise and job id; enterprise ids cannot contain '_', so the first '__' always splits them. */
+const JOB_ID_SEPARATOR = '__';
 
 /**
  * Installs a queue's repeating job under a stable scheduler id (re-registration replaces it). Exported for tests.
@@ -153,7 +157,14 @@ const jobs: StrideForwardJobs = {
             throw new Error('tenant jobs need a valid enterpriseId');
           }
           envelope.enterpriseId = enterpriseId;
-          jobId = jobId === undefined ? undefined : `${enterpriseId}:${jobId}`;
+          if (jobId !== undefined) {
+            if (!JOB_ID.test(jobId)) {
+              throw new Error('jobId must be 1-128 letters, digits, dots or hyphens');
+            }
+            jobId = `${enterpriseId}${JOB_ID_SEPARATOR}${jobId}`;
+          }
+        } else if (jobId !== undefined && !JOB_ID.test(jobId)) {
+          throw new Error('jobId must be 1-128 letters, digits, dots or hyphens');
         }
         await queue.add(name, envelope, { jobId, delay: options?.delayMs });
       },

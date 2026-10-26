@@ -3,6 +3,7 @@
 import { isNotFound, OperationOutcomeError, Operator } from '@medplum/core';
 import type { WithId } from '@medplum/core';
 import type { Patient, Project } from '@medplum/fhirtypes';
+import type * as BullMQ from 'bullmq';
 import { Worker } from 'bullmq';
 import { Router } from 'express';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -107,12 +108,21 @@ describe('StrideForward hook', () => {
       expect(seen).toEqual([{ enterpriseId: 'proj-a', data: { operationId: 'op-1' } }]);
     });
 
-    test('job ids are namespaced by enterprise, so two enterprises never collide', async () => {
+    test('job ids are namespaced by enterprise, never collide, and pass BullMQ`s own id validation', async () => {
       const queue = await host.jobs.register('sf-test-ids', { scope: 'tenant' }, async () => undefined);
       await queue.add({}, { enterpriseId: 'proj-a', jobId: 'same' });
       await queue.add({}, { enterpriseId: 'proj-b', jobId: 'same' });
+      await queue.add({}, { enterpriseId: '6f1c1f2e-9a4b-4f6a', jobId: '12345' });
       const ids = (queueRegistry.get('sf-test-ids') as unknown as { add: Mock }).add.mock.calls.map((c) => (c[2] as { jobId?: string }).jobId);
-      expect(ids).toEqual(['proj-a:same', 'proj-b:same']);
+      expect(ids).toEqual(['proj-a__same', 'proj-b__same', '6f1c1f2e-9a4b-4f6a__12345']);
+      // The real BullMQ (not the test mock) validates each generated id.
+      const real = await vi.importActual<typeof BullMQ>('bullmq');
+      const validate = (real.Job.prototype as unknown as { validateOptions: (this: unknown, d: unknown) => void }).validateOptions;
+      for (const jobId of ids) {
+        expect(() => validate.call({ opts: { jobId } }, { data: '{}' })).not.toThrow();
+      }
+      expect(() => validate.call({ opts: { jobId: 'proj-a:same' } }, { data: '{}' })).toThrow(/cannot contain/);
+      await expect(queue.add({}, { enterpriseId: 'proj-a', jobId: 'has:colon' })).rejects.toThrow(/jobId/);
     });
 
     test('a tenant job without a valid enterprise is refused at dequeue; consecutive jobs each get their own enterprise', async () => {
