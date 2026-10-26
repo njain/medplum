@@ -10,10 +10,11 @@
 // `register(host: StrideForwardHost): Promise<void> | void`. With SF_MODULES unset this hook does nothing.
 import * as medplumCore from '@medplum/core';
 import type { Project } from '@medplum/fhirtypes';
-import { Queue, Worker } from 'bullmq';
+import { Queue, UnrecoverableError, Worker } from 'bullmq';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { Router as createRouter } from 'express';
 import { getConfig } from './config/loader';
+import type { MedplumBullmqConfig } from './config/types';
 import { getAuthenticatedContext } from './context';
 import { DatabaseMode, getDatabasePool } from './database';
 import { sendOutcome } from './fhir/outcomes';
@@ -23,25 +24,36 @@ import { getGlobalSystemRepo, Repository } from './fhir/repo';
 import { PLACEHOLDER_SHARD_ID } from './fhir/sharding';
 import { getLogger } from './logger';
 import { authenticateRequest } from './oauth/middleware';
-import { defaultQueueOptions, queueRegistry } from './workers/utils';
+import { applyGlobalConcurrency, defaultQueueOptions, queueRegistry } from './workers/utils';
+
+/** What a handler receives: tenant jobs carry the enterprise they were enqueued for; platform jobs carry none. */
+export interface StrideForwardJob {
+  readonly enterpriseId?: string;
+  readonly data: Record<string, unknown>;
+}
 
 /** A module's background job queue: `add` from any node; the handler runs on nodes whose workers are enabled. */
 export interface StrideForwardQueue {
-  add(data: Record<string, unknown>, options?: { jobId?: string; delayMs?: number }): Promise<void>;
+  /** Tenant queues require `enterpriseId`; job ids are namespaced by it, so enterprises never collide. */
+  add(data: Record<string, unknown>, options?: { enterpriseId?: string; jobId?: string; delayMs?: number }): Promise<void>;
 }
+
+/**
+ * `tenant`: every job belongs to one enterprise, checked on enqueue and again on dequeue (architecture standards §5;
+ * AGENTS.md rule 9); the handler re-establishes its tenant context from `job.enterpriseId` for each job. `platform`:
+ * work across enterprises by design (the outbox sweeper), the only kind that may repeat.
+ */
+export type StrideForwardJobScope = { readonly scope: 'tenant' } | { readonly scope: 'platform'; readonly everyMs?: number };
 
 export interface StrideForwardJobs {
   /**
    * Registers a queue named `sf-<module>-<job>` on Medplum's BullMQ connection and in its queue registry (closed on
-   * shutdown). Its worker runs where MEDPLUM_WORKERS_ENABLED includes the queue name or '*' (sf-jobs), never on
-   * request nodes configured with an empty list. `everyMs` adds one repeating job under a stable scheduler id. The
-   * handler receives the job data only and re-establishes any tenant context from it.
+   * shutdown), with Medplum's BullMQ settings (concurrency, job retention, global concurrency; per-queue overrides in
+   * `workers.bullmq.<name>`). Its worker runs where MEDPLUM_WORKERS_ENABLED includes the queue name or '*' (sf-jobs),
+   * never on request nodes configured with an empty list. Resolves once the queue and any repeating job are installed,
+   * so a failure fails the module's registration and the server's startup.
    */
-  register(
-    name: string,
-    handler: (data: Record<string, unknown>) => Promise<void>,
-    options?: { everyMs?: number }
-  ): StrideForwardQueue;
+  register(name: string, scope: StrideForwardJobScope, handler: (job: StrideForwardJob) => Promise<void>): Promise<StrideForwardQueue>;
 }
 
 export interface StrideForwardHost {
@@ -73,41 +85,77 @@ export interface StrideForwardHost {
 }
 
 const QUEUE_NAME = /^sf-[a-z0-9]+(-[a-z0-9]+)*$/;
+const ENTERPRISE_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * Installs a queue's repeating job under a stable scheduler id (re-registration replaces it). Exported for tests.
+ * @param queue - The queue.
+ * @param name - The queue name; the job name and the scheduler id derive from it.
+ * @param everyMs - The interval.
+ */
+export async function installScheduler(queue: Pick<Queue, 'upsertJobScheduler'>, name: string, everyMs: number): Promise<void> {
+  await queue.upsertJobScheduler(`${name}:every`, { every: everyMs }, { name, data: {} });
+}
 
 const jobs: StrideForwardJobs = {
-  register(name, handler, options) {
+  async register(name, scope, handler) {
     if (!QUEUE_NAME.test(name)) {
       throw new Error(`StrideForward queue names must look like sf-<module>-<job>: ${name}`);
     }
     if (queueRegistry.get(name)) {
       throw new Error(`StrideForward queue ${name} is already registered`);
     }
+    const everyMs = scope.scope === 'platform' ? scope.everyMs : (scope as { everyMs?: number }).everyMs;
+    if (everyMs !== undefined && scope.scope !== 'platform') {
+      throw new Error('only platform queues may repeat');
+    }
+    if (everyMs !== undefined && (!Number.isSafeInteger(everyMs) || everyMs < 1000)) {
+      throw new Error('everyMs must be a whole number of milliseconds, at least 1000');
+    }
     const config = getConfig();
     const queueOptions = defaultQueueOptions(config);
+    const perQueue = (config.workers?.bullmq as Record<string, Partial<MedplumBullmqConfig>> | undefined)?.[name];
+    const bullmq: Partial<MedplumBullmqConfig> = { ...config.bullmq, ...perQueue };
     const queue = new Queue(name, queueOptions);
-    const enabled = config.workers?.enabled;
-    const workerEnabled = enabled === undefined || enabled.includes('*') || (enabled as string[]).includes(name);
+    const enabled = config.workers?.enabled as string[] | undefined;
+    const workerEnabled = enabled === undefined || enabled.includes('*') || enabled.includes(name);
     const worker = workerEnabled
       ? new Worker(
           name,
-          async (job: { data: Record<string, unknown> }) => {
-            await handler(job.data);
+          async (job: { data: unknown }) => {
+            const envelope = (job.data ?? {}) as { enterpriseId?: unknown; data?: unknown };
+            const data = (envelope.data ?? {}) as Record<string, unknown>;
+            if (scope.scope === 'tenant') {
+              if (typeof envelope.enterpriseId !== 'string' || !ENTERPRISE_ID.test(envelope.enterpriseId)) {
+                // Never retried: a job without its enterprise cannot be run in any tenant's context.
+                throw new UnrecoverableError('tenant job has no valid enterpriseId');
+              }
+              await handler({ enterpriseId: envelope.enterpriseId, data });
+            } else {
+              await handler({ data });
+            }
           },
-          { ...queueOptions }
+          { ...queueOptions, ...bullmq }
         )
       : undefined;
     queueRegistry.add(name, queue, worker);
-    if (options?.everyMs !== undefined) {
-      if (!Number.isSafeInteger(options.everyMs) || options.everyMs < 1000) {
-        throw new Error('everyMs must be a whole number of milliseconds, at least 1000');
-      }
-      queue.upsertJobScheduler(`${name}:every`, { every: options.everyMs }, { name, data: {} }).catch((err: unknown) => {
-        getLogger().error('StrideForward job scheduler error', { queue: name, errorType: err instanceof Error ? err.name : typeof err });
-      });
+    await applyGlobalConcurrency(queue, bullmq);
+    if (everyMs !== undefined) {
+      await installScheduler(queue, name, everyMs);
     }
     return {
-      async add(data, addOptions) {
-        await queue.add(name, data, { jobId: addOptions?.jobId, delay: addOptions?.delayMs });
+      async add(data, options) {
+        let jobId = options?.jobId;
+        const envelope: Record<string, unknown> = { data };
+        if (scope.scope === 'tenant') {
+          const enterpriseId = options?.enterpriseId;
+          if (typeof enterpriseId !== 'string' || !ENTERPRISE_ID.test(enterpriseId)) {
+            throw new Error('tenant jobs need a valid enterpriseId');
+          }
+          envelope.enterpriseId = enterpriseId;
+          jobId = jobId === undefined ? undefined : `${enterpriseId}:${jobId}`;
+        }
+        await queue.add(name, envelope, { jobId, delay: options?.delayMs });
       },
     };
   },

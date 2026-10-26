@@ -14,7 +14,7 @@ import { loadTestConfig } from './config/loader';
 import type { Repository } from './fhir/repo';
 import { repoAccess } from './fhir/repository/access-tracker';
 import type { StrideForwardHost } from './sf-hook';
-import { registerStrideForwardModules } from './sf-hook';
+import { installScheduler, registerStrideForwardModules } from './sf-hook';
 import { createTestProject, withTestContext } from './test.setup';
 import { queueRegistry } from './workers/utils';
 
@@ -89,29 +89,71 @@ describe('StrideForward hook', () => {
   });
 
   describe('jobs', () => {
-    test('register creates a queue and a worker whose processor hands the job data to the handler', async () => {
+    const workerFor = (name: string): unknown[] | undefined => (Worker as unknown as Mock).mock.calls.find((c) => c[0] === name);
+    const processorFor = (name: string): ((job: { data: unknown }) => Promise<void>) | undefined =>
+      workerFor(name)?.[1] as ((job: { data: unknown }) => Promise<void>) | undefined;
+
+    test('a tenant queue requires an enterprise on enqueue and hands it to the handler with the data', async () => {
       const seen: unknown[] = [];
-      const queue = host.jobs.register('sf-test-dispatch', async (data) => {
-        seen.push(data);
+      const queue = await host.jobs.register('sf-test-dispatch', { scope: 'tenant' }, async (job) => {
+        seen.push(job);
       });
       expect(queueRegistry.get('sf-test-dispatch')).toBeDefined();
-      await queue.add({ operationId: 'op-1' });
-      const created = (Worker as unknown as Mock).mock.calls.find((c) => c[0] === 'sf-test-dispatch');
-      const processor = created?.[1] as ((job: { data: unknown }) => Promise<void>) | undefined;
-      expect(processor).toBeDefined();
-      await processor?.({ data: { operationId: 'op-1' } });
-      expect(seen).toEqual([{ operationId: 'op-1' }]);
+      await expect(queue.add({ operationId: 'op-1' })).rejects.toThrow(/enterpriseId/);
+      await queue.add({ operationId: 'op-1' }, { enterpriseId: 'proj-a' });
+      const added = (queueRegistry.get('sf-test-dispatch') as unknown as { add: Mock }).add.mock.calls.at(-1);
+      expect(added?.[1]).toEqual({ enterpriseId: 'proj-a', data: { operationId: 'op-1' } });
+      await processorFor('sf-test-dispatch')?.({ data: added?.[1] });
+      expect(seen).toEqual([{ enterpriseId: 'proj-a', data: { operationId: 'op-1' } }]);
     });
 
-    test('a repeating job is scheduled once under a stable id', async () => {
-      host.jobs.register('sf-test-sweep', async () => undefined, { everyMs: 5000 });
+    test('job ids are namespaced by enterprise, so two enterprises never collide', async () => {
+      const queue = await host.jobs.register('sf-test-ids', { scope: 'tenant' }, async () => undefined);
+      await queue.add({}, { enterpriseId: 'proj-a', jobId: 'same' });
+      await queue.add({}, { enterpriseId: 'proj-b', jobId: 'same' });
+      const ids = (queueRegistry.get('sf-test-ids') as unknown as { add: Mock }).add.mock.calls.map((c) => (c[2] as { jobId?: string }).jobId);
+      expect(ids).toEqual(['proj-a:same', 'proj-b:same']);
+    });
+
+    test('a tenant job without a valid enterprise is refused at dequeue; consecutive jobs each get their own enterprise', async () => {
+      const seen: (string | undefined)[] = [];
+      await host.jobs.register('sf-test-dequeue', { scope: 'tenant' }, async (job) => {
+        seen.push(job.enterpriseId);
+      });
+      const run = processorFor('sf-test-dequeue');
+      await expect(run?.({ data: { data: {} } })).rejects.toThrow(/enterpriseId/);
+      await expect(run?.({ data: { enterpriseId: 'bad id!', data: {} } })).rejects.toThrow(/enterpriseId/);
+      await run?.({ data: { enterpriseId: 'proj-a', data: {} } });
+      await run?.({ data: { enterpriseId: 'proj-b', data: {} } });
+      expect(seen).toEqual(['proj-a', 'proj-b']);
+    });
+
+    test('a platform queue carries no enterprise and may repeat; a tenant queue may not repeat', async () => {
+      await host.jobs.register('sf-test-sweep', { scope: 'platform', everyMs: 5000 }, async () => undefined);
       const q = queueRegistry.get('sf-test-sweep') as unknown as { upsertJobScheduler: Mock };
       expect(q.upsertJobScheduler).toHaveBeenCalledWith('sf-test-sweep:every', { every: 5000 }, expect.objectContaining({ name: 'sf-test-sweep' }));
+      await expect(host.jobs.register('sf-test-bad-repeat', { scope: 'tenant', everyMs: 5000 } as never, async () => undefined)).rejects.toThrow(/platform/);
     });
 
-    test('queue names are namespaced and registered once', () => {
-      expect(() => host.jobs.register('not-namespaced', async () => undefined)).toThrow(/sf-/);
-      expect(() => host.jobs.register('sf-test-dispatch', async () => undefined)).toThrow();
+    test('workers get Medplum`s BullMQ settings (concurrency, job retention) and its global concurrency', async () => {
+      await host.jobs.register('sf-test-config', { scope: 'platform' }, async () => undefined);
+      const options = workerFor('sf-test-config')?.[2] as Record<string, unknown>;
+      expect(options).toMatchObject({ concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } });
+      const q = queueRegistry.get('sf-test-config') as unknown as { removeGlobalConcurrency: Mock; setGlobalConcurrency: Mock };
+      expect(q.removeGlobalConcurrency.mock.calls.length + q.setGlobalConcurrency.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    test('installing the repeating job propagates a failure (registration awaits it, so startup fails)', async () => {
+      const failing = { upsertJobScheduler: vi.fn().mockRejectedValue(new Error('redis down')) };
+      await expect(installScheduler(failing as never, 'sf-test-x', 5000)).rejects.toThrow('redis down');
+      const ok = { upsertJobScheduler: vi.fn().mockResolvedValue(undefined) };
+      await installScheduler(ok as never, 'sf-test-x', 5000);
+      expect(ok.upsertJobScheduler).toHaveBeenCalledWith('sf-test-x:every', { every: 5000 }, { name: 'sf-test-x', data: {} });
+    });
+
+    test('queue names are namespaced and registered once', async () => {
+      await expect(host.jobs.register('not-namespaced', { scope: 'platform' }, async () => undefined)).rejects.toThrow(/sf-/);
+      await expect(host.jobs.register('sf-test-dispatch', { scope: 'tenant' }, async () => undefined)).rejects.toThrow(/already/);
     });
   });
 });
