@@ -615,4 +615,46 @@ describe('On Behalf Of', () => {
         config.logAuditEvents = wasLogging;
       }
     }));
+
+  test('Audit events keep a human admin who acts on behalf of a member', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const admin = await addTestUser(project);
+      const systemRepo = await getProjectSystemRepo(project);
+      await systemRepo.updateResource({ ...admin.membership, admin: true });
+      const member = await addTestUser(project);
+      const memberRef = getReferenceString(member.profile);
+      const adminRef = getReferenceString(admin.profile);
+      const created = await request(app)
+        .post('/fhir/R4/Patient')
+        .set('Authorization', 'Bearer ' + admin.accessToken)
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(created).toHaveStatus(201);
+      const patient = created.body as Patient;
+
+      const config = getConfig();
+      const wasLogging = config.logAuditEvents;
+      config.logAuditEvents = true;
+      const spy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        const read = await request(app)
+          .get('/fhir/R4/Patient/' + patient.id)
+          .set('Authorization', 'Bearer ' + admin.accessToken)
+          .set('X-Medplum-On-Behalf-Of', memberRef);
+        expect(read).toHaveStatus(200);
+        const [event] = spy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((line) => line.includes('"resourceType":"AuditEvent"'))
+          .map((line) => JSON.parse(line) as AuditEvent);
+        // The member acted for is the requestor; the signed-in admin stays on the record, not labelled an application.
+        expect(event.agent).toHaveLength(2);
+        expect(event.agent?.[0]).toMatchObject({ who: { reference: memberRef }, requestor: true });
+        expect(event.agent?.[1]).toMatchObject({ who: { reference: adminRef }, requestor: false });
+        expect(event.agent?.[1]?.type).toBeUndefined();
+      } finally {
+        spy.mockRestore();
+        config.logAuditEvents = wasLogging;
+      }
+    }));
 });

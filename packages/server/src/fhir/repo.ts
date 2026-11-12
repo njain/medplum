@@ -58,6 +58,7 @@ import type {
   OperationDefinitionParameter,
   OperationOutcome,
   Parameters,
+  Practitioner,
   Project,
   Reference,
   Resource,
@@ -83,6 +84,7 @@ import { getBinaryStorageKey } from '../storage/base';
 import { deleteBinaryStorageObjects, getBinaryStorage } from '../storage/loader';
 import type { AuditEventSubtype } from '../util/auditevent';
 import {
+  applyOptionalRedaction,
   AuditEventOutcome,
   createAuditEvent,
   CreateInteraction,
@@ -2383,13 +2385,19 @@ export class Repository extends FhirRepository implements Disposable {
       query = options.searchRequest.resourceType + formatSearchQuery(options.searchRequest);
     }
 
-    // StrideForward: on an X-Medplum-On-Behalf-Of request the actor is the member acted for, and the authenticating
-    // client (the author) is recorded as the second, non-requestor agent (createAuditEvent's `client`).
+    // StrideForward (named patch sf-audit): on an X-Medplum-On-Behalf-Of request the actor is the member acted for. The
+    // authenticating client stays on the record as the non-requestor client agent, and the signed-in author, when it is
+    // neither (an admin user acting for a member), as a further non-requestor agent, never labelled an application.
+    const onBehalfOf = this.context.onBehalfOf;
+    const author = this.context.author;
+    const authorIsClient = author?.reference?.startsWith('ClientApplication/') === true;
+    const client =
+      this.context.client ?? (onBehalfOf && authorIsClient ? (author as Reference<ClientApplication>) : undefined);
     const auditEvent = createAuditEvent(
       RestfulOperationType,
       subtype,
       this.context.projects?.[0]?.id as string,
-      this.context.onBehalfOf ?? this.context.author,
+      onBehalfOf ?? author,
       this.context.remoteAddress,
       outcome,
       {
@@ -2398,11 +2406,17 @@ export class Repository extends FhirRepository implements Disposable {
         searchQuery: query,
         entityDetail: options?.entityDetail,
         durationMs: options?.durationMs,
-        client:
-          this.context.client ??
-          (this.context.onBehalfOf ? (this.context.author as Reference<ClientApplication>) : undefined),
+        client,
       }
     );
+    if (
+      onBehalfOf &&
+      author?.reference &&
+      author.reference !== onBehalfOf.reference &&
+      author.reference !== client?.reference
+    ) {
+      auditEvent.agent?.push({ who: applyOptionalRedaction(author) as Reference<Practitioner>, requestor: false });
+    }
     logAuditEvent(auditEvent);
 
     if (getConfig().saveAuditEvents && isResource(resource) && resource?.resourceType !== 'AuditEvent') {
