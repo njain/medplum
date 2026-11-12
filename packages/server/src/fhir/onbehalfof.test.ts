@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { ContentType, getReferenceString } from '@medplum/core';
-import type { OperationOutcome, OperationOutcomeIssue, Patient } from '@medplum/fhirtypes';
+import type { AuditEvent, OperationOutcome, OperationOutcomeIssue, Patient } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { initApp, shutdownApp } from '../app';
-import { loadTestConfig } from '../config/loader';
+import { getConfig, loadTestConfig } from '../config/loader';
 import { addTestUser, createTestProject, withTestContext } from '../test.setup';
 import { getProjectSystemRepo } from './repo';
 
@@ -555,5 +556,63 @@ describe('On Behalf Of', () => {
       expect(patient3.meta?.account?.reference).toStrictEqual(account);
       expect(patient3.meta?.accounts?.length).toStrictEqual(1);
       expect(patient3.meta?.accounts?.[0]?.reference).toStrictEqual(account);
+    }));
+
+  // StrideForward (trust-layer increment 2): the logged audit event names the member acted for as the requestor and
+  // the authenticating client as a second, non-requestor agent, on single-resource reads and searches alike.
+  test('Audit events name the on-behalf-of member as the actor', () =>
+    withTestContext(async () => {
+      const { client, project } = await createTestProject({ withClient: true, membership: { admin: true } });
+      const basicAuth = 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64');
+      const member = await addTestUser(project);
+      const memberRef = getReferenceString(member.profile);
+      const clientRef = getReferenceString(client);
+
+      const created = await request(app)
+        .post('/fhir/R4/Patient')
+        .set('Authorization', basicAuth)
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(created).toHaveStatus(201);
+
+      const config = getConfig();
+      const wasLogging = config.logAuditEvents;
+      config.logAuditEvents = true;
+      const spy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        const read = await request(app)
+          .get('/fhir/R4/Patient/' + created.body.id)
+          .set('Authorization', basicAuth)
+          .set('X-Medplum-On-Behalf-Of', memberRef);
+        expect(read).toHaveStatus(200);
+        const search = await request(app)
+          .get('/fhir/R4/Patient?_id=' + created.body.id)
+          .set('Authorization', basicAuth)
+          .set('X-Medplum-On-Behalf-Of', memberRef);
+        expect(search).toHaveStatus(200);
+        const own = await request(app)
+          .get('/fhir/R4/Patient/' + created.body.id)
+          .set('Authorization', basicAuth);
+        expect(own).toHaveStatus(200);
+
+        const events = spy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((line) => line.includes('"resourceType":"AuditEvent"'))
+          .map((line) => JSON.parse(line) as AuditEvent);
+        const bySubtype = (code: string): AuditEvent[] => events.filter((e) => e.subtype?.[0]?.code === code);
+        const [onBehalfRead, ownRead] = bySubtype('read');
+        const [onBehalfSearch] = bySubtype('search');
+        for (const event of [onBehalfRead, onBehalfSearch]) {
+          expect(event.agent).toHaveLength(2);
+          expect(event.agent[0]).toMatchObject({ who: { reference: memberRef }, requestor: true });
+          expect(event.agent[1]).toMatchObject({ who: { reference: clientRef }, requestor: false });
+        }
+        // Without the header, the client is the actor, recorded once.
+        expect(ownRead.agent).toHaveLength(1);
+        expect(ownRead.agent[0]).toMatchObject({ who: { reference: clientRef }, requestor: true });
+      } finally {
+        spy.mockRestore();
+        config.logAuditEvents = wasLogging;
+      }
     }));
 });

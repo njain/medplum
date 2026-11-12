@@ -52,6 +52,7 @@ import type {
   Binary,
   Bundle,
   BundleEntry,
+  ClientApplication,
   Meta,
   OperationDefinition,
   OperationDefinitionParameter,
@@ -2382,11 +2383,13 @@ export class Repository extends FhirRepository implements Disposable {
       query = options.searchRequest.resourceType + formatSearchQuery(options.searchRequest);
     }
 
+    // StrideForward: on an X-Medplum-On-Behalf-Of request the actor is the member acted for, and the authenticating
+    // client (the author) is recorded as the second, non-requestor agent (createAuditEvent's `client`).
     const auditEvent = createAuditEvent(
       RestfulOperationType,
       subtype,
       this.context.projects?.[0]?.id as string,
-      this.context.author,
+      this.context.onBehalfOf ?? this.context.author,
       this.context.remoteAddress,
       outcome,
       {
@@ -2395,7 +2398,9 @@ export class Repository extends FhirRepository implements Disposable {
         searchQuery: query,
         entityDetail: options?.entityDetail,
         durationMs: options?.durationMs,
-        client: this.context.client,
+        client:
+          this.context.client ??
+          (this.context.onBehalfOf ? (this.context.author as Reference<ClientApplication>) : undefined),
       }
     );
     logAuditEvent(auditEvent);
