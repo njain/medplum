@@ -1754,20 +1754,26 @@ function buildChainedSearchUsingReferenceTable(
  * may search, with the same project and access-policy filters as a direct search of that type
  * (`<table>.id = ANY(SELECT id FROM <type> WHERE <filters>)`). Without it, `_has` and forward chains match resources
  * the caller cannot read, so a search reveals what a hidden resource contains (e.g.
- * `Patient?_has:Observation:subject:code=X` names the patients who have a hidden result). Skipped while an access
- * policy's own criteria are being built: they define the policy and are applied as written (which also prevents
- * recursion between policies that chain into each other).
+ * `Patient?_has:Observation:subject:code=X` names the patients who have a hidden result). While an access policy's
+ * own criteria are being built, only the project filter applies: the criteria define the policy and are applied as
+ * written (which also prevents recursion between policies that chain into each other), but another project's
+ * resources can never satisfy them.
  * @param repo - The repository.
  * @param innerQuery - The chained search's EXISTS subquery.
  * @param link - The chain link just joined.
  * @param table - The table or join alias holding the link's target resources.
  */
 function addChainLinkSecurity(repo: Repository, innerQuery: SelectQuery, link: ChainedSearchLink, table: string): void {
-  if (repo.isBuildingAccessPolicyCriteria()) {
-    return;
-  }
   const visible = new SelectQuery(link.targetType).column('id');
-  repo.addSecurityFilters(visible, link.targetType, AccessPolicyInteraction.SEARCH);
+  if (repo.isBuildingAccessPolicyCriteria()) {
+    // Inside policy criteria: the project boundary always holds; only the policy itself is not applied again.
+    const projectIds = repo.getSearchProjectIds(link.targetType);
+    if (projectIds) {
+      visible.where('projectId', 'IN', projectIds);
+    }
+  } else {
+    repo.addSecurityFilters(visible, link.targetType, AccessPolicyInteraction.SEARCH);
+  }
   if (visible.predicate.expressions.length > 0) {
     innerQuery.whereExpr(new Condition(new Column(table, 'id'), 'IN_SUBQUERY', visible));
   }

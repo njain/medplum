@@ -145,4 +145,26 @@ describe('sf-has: chained search honours the access policy', () => {
       expect(visible.map((o) => o.subject?.reference)).toStrictEqual(['Patient/' + patientA.id]);
       expect(await ids(repo, `Patient?_has:Observation:subject:code=${ESTRADIOL}`)).toStrictEqual([patientA.id]);
     }));
+
+  test('chained policy criteria cannot be satisfied from another project', () =>
+    withTestContext(async () => {
+      // Another project's Observation references this project's patient B; it must not satisfy B's chained policy.
+      const other = (await createTestProject()).project;
+      const otherRepo = await getProjectSystemRepo(other);
+      await otherRepo.createResource<Observation>({
+        resourceType: 'Observation',
+        meta: { project: other.id },
+        status: 'final',
+        code: { coding: [{ system: 'http://example.com/sf-has', code: 'foreign' }] },
+        subject: { reference: 'Patient/' + patientB.id },
+      });
+      const repo = repoWith([
+        {
+          resourceType: 'Patient',
+          criteria: 'Patient?_has:Observation:subject:code=http://example.com/sf-has|foreign',
+        },
+        { resourceType: 'Observation' },
+      ]);
+      expect(await ids(repo, 'Patient')).toStrictEqual([]);
+    }));
 });
