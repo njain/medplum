@@ -1712,6 +1712,7 @@ function buildChainedSearchUsingReferenceTable(
     );
     currentTable = linkLiteralReference(innerQuery, currentTable, link);
   }
+  addChainLinkSecurity(repo, innerQuery, link, currentTable); // sf-has
 
   // Add joins to inner query for all subsequent chain links
   for (let i = 1; i < param.chain.length; i++) {
@@ -1729,6 +1730,7 @@ function buildChainedSearchUsingReferenceTable(
       const lookupTable = linkReferenceLookupTable(innerQuery, currentTable, link);
       currentTable = linkLiteralReference(innerQuery, lookupTable, link);
     }
+    addChainLinkSecurity(repo, innerQuery, link, currentTable); // sf-has
   }
 
   // Add terminal conditions on final target table, and return EXISTS() over subquery
@@ -1745,6 +1747,30 @@ function buildChainedSearchUsingReferenceTable(
       )
     );
   return new SqlFunction('EXISTS', [innerQuery]);
+}
+
+/**
+ * sf-has (named patch, StrideForward fork): restricts a chained-search link's target table to the resources the caller
+ * may search, with the same project and access-policy filters as a direct search of that type
+ * (`<table>.id = ANY(SELECT id FROM <type> WHERE <filters>)`). Without it, `_has` and forward chains match resources
+ * the caller cannot read, so a search reveals what a hidden resource contains (e.g.
+ * `Patient?_has:Observation:subject:code=X` names the patients who have a hidden result). Skipped while an access
+ * policy's own criteria are being built: they define the policy and are applied as written (which also prevents
+ * recursion between policies that chain into each other).
+ * @param repo - The repository.
+ * @param innerQuery - The chained search's EXISTS subquery.
+ * @param link - The chain link just joined.
+ * @param table - The table or join alias holding the link's target resources.
+ */
+function addChainLinkSecurity(repo: Repository, innerQuery: SelectQuery, link: ChainedSearchLink, table: string): void {
+  if (repo.isBuildingAccessPolicyCriteria()) {
+    return;
+  }
+  const visible = new SelectQuery(link.targetType).column('id');
+  repo.addSecurityFilters(visible, link.targetType, AccessPolicyInteraction.SEARCH);
+  if (visible.predicate.expressions.length > 0) {
+    innerQuery.whereExpr(new Condition(new Column(table, 'id'), 'IN_SUBQUERY', visible));
+  }
 }
 
 /**

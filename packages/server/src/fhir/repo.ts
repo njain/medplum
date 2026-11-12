@@ -1755,6 +1755,18 @@ export class Repository extends FhirRepository implements Disposable {
     this.addAccessPolicyFilters(builder, resourceType, interaction);
   }
 
+  /** sf-has: depth of access-policy criteria being built (see isBuildingAccessPolicyCriteria). */
+  private accessPolicyCriteriaDepth = 0;
+
+  /**
+   * sf-has (named patch, StrideForward fork): true while an access policy's own criteria are being turned into SQL,
+   * so chained-search links inside them are not filtered by the policy again.
+   * @returns True while building access-policy criteria.
+   */
+  isBuildingAccessPolicyCriteria(): boolean {
+    return this.accessPolicyCriteriaDepth > 0;
+  }
+
   /**
    * Returns the project IDs that searches for the given resource type are restricted to.
    * @param resourceType - The resource type being searched.
@@ -1843,12 +1855,13 @@ export class Repository extends FhirRepository implements Disposable {
             criteria = resourceType + '?' + criteria.slice(queryIndex + 1);
           }
           const searchRequest = parseSearchRequest(criteria);
-          const accessPolicyExpression = buildSearchExpression(
-            this,
-            builder,
-            searchRequest.resourceType,
-            searchRequest
-          );
+          let accessPolicyExpression: Expression | undefined;
+          this.accessPolicyCriteriaDepth++; // sf-has
+          try {
+            accessPolicyExpression = buildSearchExpression(this, builder, searchRequest.resourceType, searchRequest);
+          } finally {
+            this.accessPolicyCriteriaDepth--;
+          }
           if (accessPolicyExpression) {
             expressions.push(accessPolicyExpression);
           }

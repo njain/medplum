@@ -2507,7 +2507,9 @@ describe.each<Project['features']>([undefined, ['range-search']])('project-scope
         const beforeReindex = await repo.search(searchRequest);
         expect(beforeReindex.entry).toHaveLength(0);
 
-        await systemRepo.reindexResources([obs]);
+        // sf-has: reindex the stored copy. The copy createResource returns has no meta.project, so reindexing it moves
+        // the Observation out of this project; chained search no longer looks through resources the caller cannot see.
+        await systemRepo.reindexResources([await systemRepo.readResource<Observation>('Observation', obs.id)]);
         const afterReindex = await repo.search(searchRequest);
         expect(afterReindex.entry?.map((e) => e.resource?.id)).toStrictEqual([patient.id]);
       }));
