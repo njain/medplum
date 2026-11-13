@@ -132,10 +132,14 @@ describe('StrideForward hook', () => {
           expect(await host.setAccounts(repo, 'Patient', patient.id, [], true)).toBe(2);
           expect((await repo.readResource<Observation>('Observation', obs.id)).meta?.accounts ?? []).toStrictEqual([]);
           // Another project's patient is not found from this project.
-          const inB = await (await host.systemRepo(projectB.id)).createResource<Patient>({ resourceType: 'Patient' });
-          await expect(host.setAccounts(repo, 'Patient', inB.id, [], true)).rejects.toBeInstanceOf(
-            OperationOutcomeError
-          );
+          const repoB = await host.systemRepo(projectB.id);
+          const inB = await repoB.createResource<Patient>({ resourceType: 'Patient' });
+          const err = await host.setAccounts(repo, 'Patient', inB.id, [team], true).catch((e: unknown) => e);
+          expect(err).toBeInstanceOf(OperationOutcomeError);
+          expect(isNotFound((err as OperationOutcomeError).outcome)).toBe(true);
+          const after = await repoB.readResource<Patient>('Patient', inB.id);
+          expect(after.meta?.versionId).toBe(inB.meta?.versionId);
+          expect(after.meta?.accounts ?? []).toStrictEqual([]);
         }
       );
     });
