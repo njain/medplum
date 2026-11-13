@@ -9,7 +9,7 @@
 // SF_MODULES is a comma-separated list of module entry files (absolute paths). Each exports
 // `register(host: StrideForwardHost): Promise<void> | void`. With SF_MODULES unset this hook does nothing.
 import * as medplumCore from '@medplum/core';
-import type { Project } from '@medplum/fhirtypes';
+import type { Project, ResourceType } from '@medplum/fhirtypes';
 import { Queue, UnrecoverableError, Worker } from 'bullmq';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { Router as createRouter } from 'express';
@@ -17,10 +17,12 @@ import { getConfig } from './config/loader';
 import type { MedplumBullmqConfig } from './config/types';
 import { getAuthenticatedContext } from './context';
 import { DatabaseMode, getDatabasePool } from './database';
+import { setResourceAccounts } from './fhir/operations/set-accounts';
 import { sendOutcome } from './fhir/outcomes';
+import { getPatientCompartments } from './fhir/patient';
+import { getGlobalSystemRepo, Repository } from './fhir/repo';
 import type { TransactionSqlOptions } from './fhir/repository/access-tracker';
 import { repoAccess } from './fhir/repository/access-tracker';
-import { getGlobalSystemRepo, Repository } from './fhir/repo';
 import { PLACEHOLDER_SHARD_ID } from './fhir/sharding';
 import { getLogger } from './logger';
 import { authenticateRequest } from './oauth/middleware';
@@ -35,7 +37,10 @@ export interface StrideForwardJob {
 /** A module's background job queue: `add` from any node; the handler runs on nodes whose workers are enabled. */
 export interface StrideForwardQueue {
   /** Tenant queues require `enterpriseId`; job ids are namespaced by it, so enterprises never collide. */
-  add(data: Record<string, unknown>, options?: { enterpriseId?: string; jobId?: string; delayMs?: number }): Promise<void>;
+  add(
+    data: Record<string, unknown>,
+    options?: { enterpriseId?: string; jobId?: string; delayMs?: number }
+  ): Promise<void>;
 }
 
 /**
@@ -43,7 +48,8 @@ export interface StrideForwardQueue {
  * AGENTS.md rule 9); the handler re-establishes its tenant context from `job.enterpriseId` for each job. `platform`:
  * work across enterprises by design (the outbox sweeper), the only kind that may repeat.
  */
-export type StrideForwardJobScope = { readonly scope: 'tenant' } | { readonly scope: 'platform'; readonly everyMs?: number };
+export type StrideForwardJobScope =
+  { readonly scope: 'tenant' } | { readonly scope: 'platform'; readonly everyMs?: number };
 
 export interface StrideForwardJobs {
   /**
@@ -53,7 +59,11 @@ export interface StrideForwardJobs {
    * never on request nodes configured with an empty list. Resolves once the queue and any repeating job are installed,
    * so a failure fails the module's registration and the server's startup.
    */
-  register(name: string, scope: StrideForwardJobScope, handler: (job: StrideForwardJob) => Promise<void>): Promise<StrideForwardQueue>;
+  register(
+    name: string,
+    scope: StrideForwardJobScope,
+    handler: (job: StrideForwardJob) => Promise<void>
+  ): Promise<StrideForwardQueue>;
 }
 
 export interface StrideForwardHost {
@@ -70,7 +80,11 @@ export interface StrideForwardHost {
    * error from module SQL is replaced by a generic OperationOutcomeError before Medplum wraps it, so database messages
    * never reach the client. Modules must not register pre-commit callbacks on `tx`.
    */
-  readonly withTransaction: <T>(repo: Repository, callback: (tx: Repository) => Promise<T>, options: TransactionSqlOptions) => Promise<T>;
+  readonly withTransaction: <T>(
+    repo: Repository,
+    callback: (tx: Repository) => Promise<T>,
+    options: TransactionSqlOptions
+  ) => Promise<T>;
   /** Call per use: inside a request it returns the logger carrying that request's project, request and trace ids. */
   readonly getLogger: typeof getLogger;
   readonly core: typeof medplumCore;
@@ -82,6 +96,22 @@ export interface StrideForwardHost {
    * project; this one reads and writes nothing outside it. Fails for a project that does not exist.
    */
   readonly systemRepo: (projectId: string) => Promise<Repository>;
+  /**
+   * Medplum's own `$set-accounts` (setResourceAccounts): sets the resource's `meta.accounts` and, with `propagate` on
+   * a Patient, adds and removes the changed accounts on every resource in its compartment (one write each; the
+   * compartment search runs as `repo`, so it stays in the project). `repo` must be a project admin (`systemRepo`).
+   * Needs a request context (Medplum's rate limiter): call it from a route, not a job.
+   * @returns Medplum's `resourcesUpdated` (the target included).
+   */
+  readonly setAccounts: (
+    repo: Repository,
+    resourceType: ResourceType,
+    id: string,
+    accounts: readonly string[],
+    propagate: boolean
+  ) => Promise<number>;
+  /** The resource types in Medplum's Patient compartment definition, Binary excluded (it has no search). */
+  readonly patientCompartmentTypes: () => string[];
 }
 
 const QUEUE_NAME = /^sf-[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -97,7 +127,11 @@ const JOB_ID_SEPARATOR = '__';
  * @param name - The queue name; the job name and the scheduler id derive from it.
  * @param everyMs - The interval.
  */
-export async function installScheduler(queue: Pick<Queue, 'upsertJobScheduler'>, name: string, everyMs: number): Promise<void> {
+export async function installScheduler(
+  queue: Pick<Queue, 'upsertJobScheduler'>,
+  name: string,
+  everyMs: number
+): Promise<void> {
   await queue.upsertJobScheduler(`${name}:every`, { every: everyMs }, { name, data: {} });
 }
 
@@ -172,6 +206,28 @@ const jobs: StrideForwardJobs = {
   },
 };
 
+async function setAccounts(
+  repo: Repository,
+  resourceType: ResourceType,
+  id: string,
+  accounts: readonly string[],
+  propagate: boolean
+): Promise<number> {
+  const out = await setResourceAccounts(repo, resourceType, id, {
+    accounts: accounts.map((reference) => ({ reference })),
+    propagate,
+  });
+  const updated = out.parameter?.find((p) => p.name === 'resourcesUpdated')?.valueInteger;
+  if (typeof updated !== 'number') {
+    throw new Error('setResourceAccounts returned no resourcesUpdated');
+  }
+  return updated;
+}
+
+function patientCompartmentTypes(): string[] {
+  return (getPatientCompartments().resource ?? []).map((r) => r.code as string).filter((code) => code !== 'Binary');
+}
+
 async function projectSystemRepo(projectId: string): Promise<Repository> {
   const project = await getGlobalSystemRepo().readResource<Project>('Project', projectId);
   return new Repository({
@@ -208,6 +264,8 @@ export async function registerStrideForwardModules(apiRouter: Router): Promise<v
       core: medplumCore,
       jobs,
       systemRepo: projectSystemRepo,
+      setAccounts,
+      patientCompartmentTypes,
     });
     router.use(moduleErrorBoundary(name));
     apiRouter.use(`/sf/${name}/`, router);
@@ -234,7 +292,10 @@ function moduleErrorBoundary(name: string) {
       return;
     }
     // Log the error's type only: messages can carry PHI (security §9). The request ids come from the request logger.
-    getLogger().error('StrideForward module error', { module: name, errorType: err instanceof Error ? err.name : typeof err });
+    getLogger().error('StrideForward module error', {
+      module: name,
+      errorType: err instanceof Error ? err.name : typeof err,
+    });
     sendOutcome(res, medplumCore.serverError(new Error('Internal server error')));
   };
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // StrideForward registration hook: the host additions modules rely on (first-module brief §6; plan item 1.9).
-import { isNotFound, OperationOutcomeError, Operator } from '@medplum/core';
 import type { WithId } from '@medplum/core';
-import type { Patient, Project } from '@medplum/fhirtypes';
+import { isNotFound, OperationOutcomeError, Operator } from '@medplum/core';
+import type { Observation, Patient, Project } from '@medplum/fhirtypes';
 import type * as BullMQ from 'bullmq';
 import { Worker } from 'bullmq';
 import { Router } from 'express';
@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import type { Mock } from 'vitest';
 import { initAppServices, shutdownApp } from './app';
 import { loadTestConfig } from './config/loader';
+import { runInAuthenticatedContext } from './context';
 import type { Repository } from './fhir/repo';
 import { repoAccess } from './fhir/repository/access-tracker';
 import type { StrideForwardHost } from './sf-hook';
@@ -31,7 +32,10 @@ describe('StrideForward hook', () => {
     // A module file that hands its host to the test.
     const dir = mkdtempSync(join(tmpdir(), 'sf-hook-'));
     const entry = join(dir, 'capture.mjs');
-    writeFileSync(entry, "export const name = 'capture';\nexport function register(host) { globalThis.__sfHost = host; }\n");
+    writeFileSync(
+      entry,
+      "export const name = 'capture';\nexport function register(host) { globalThis.__sfHost = host; }\n"
+    );
     process.env.SF_MODULES = entry;
     await registerStrideForwardModules(Router());
     host = (globalThis as unknown as { __sfHost: StrideForwardHost }).__sfHost;
@@ -70,27 +74,83 @@ describe('StrideForward hook', () => {
   describe('systemRepo(projectId)', () => {
     test('writes land in that project only', async () => {
       const repo = await host.systemRepo(projectA.id);
-      const patient = await withTestContext(() => repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'Synthetic' }] }));
+      const patient = await withTestContext(() =>
+        repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'Synthetic' }] })
+      );
       expect(patient.meta?.project).toBe(projectA.id);
     });
 
     test('cannot read another project`s resources', async () => {
-      const inB = await (await host.systemRepo(projectB.id)).createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'Other' }] });
+      const inB = await (
+        await host.systemRepo(projectB.id)
+      ).createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'Other' }] });
       const repo = await host.systemRepo(projectA.id);
       const err = await repo.readResource<Patient>('Patient', inB.id).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(OperationOutcomeError);
       expect(isNotFound((err as OperationOutcomeError).outcome)).toBe(true);
-      const found = await repo.searchResources<Patient>({ resourceType: 'Patient', filters: [{ code: '_id', operator: Operator.EQUALS, value: inB.id }] });
+      const found = await repo.searchResources<Patient>({
+        resourceType: 'Patient',
+        filters: [{ code: '_id', operator: Operator.EQUALS, value: inB.id }],
+      });
       expect(found).toHaveLength(0);
     });
 
     test('refuses a project that does not exist', async () => {
-      await expect(host.systemRepo('00000000-0000-0000-0000-000000000000')).rejects.toBeInstanceOf(OperationOutcomeError);
+      await expect(host.systemRepo('00000000-0000-0000-0000-000000000000')).rejects.toBeInstanceOf(
+        OperationOutcomeError
+      );
+    });
+  });
+
+  describe('setAccounts (Medplum`s $set-accounts)', () => {
+    test('sets the patient`s accounts and propagates them through its compartment, in the project only', async () => {
+      // Medplum's operation records the write on the request's rate limiter, so it runs in an authenticated request.
+      const { project, login, membership } = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+      await runInAuthenticatedContext(
+        { project, login, membership, userConfig: { resourceType: 'UserConfiguration' } },
+        undefined,
+        undefined,
+        undefined,
+        async () => {
+          const repo = await host.systemRepo(project.id);
+          const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
+          const obs = await repo.createResource<Observation>({
+            resourceType: 'Observation',
+            status: 'final',
+            code: { text: 'synthetic' },
+            subject: { reference: 'Patient/' + patient.id },
+          });
+          const team = 'Organization/' + project.id;
+          expect(await host.setAccounts(repo, 'Patient', patient.id, [team], true)).toBe(2);
+          expect(
+            (await repo.readResource<Observation>('Observation', obs.id)).meta?.accounts?.map((a) => a.reference)
+          ).toStrictEqual([team]);
+          expect(await host.setAccounts(repo, 'Patient', patient.id, [], true)).toBe(2);
+          expect((await repo.readResource<Observation>('Observation', obs.id)).meta?.accounts ?? []).toStrictEqual([]);
+          // Another project's patient is not found from this project.
+          const inB = await (await host.systemRepo(projectB.id)).createResource<Patient>({ resourceType: 'Patient' });
+          await expect(host.setAccounts(repo, 'Patient', inB.id, [], true)).rejects.toBeInstanceOf(
+            OperationOutcomeError
+          );
+        }
+      );
+    });
+
+    test('patientCompartmentTypes lists the compartment`s types without Binary', () => {
+      const types = host.patientCompartmentTypes();
+      expect(types).toContain('Observation');
+      expect(types).toContain('Encounter');
+      expect(types).not.toContain('Binary');
     });
   });
 
   describe('jobs', () => {
-    const workerFor = (name: string): unknown[] | undefined => (Worker as unknown as Mock).mock.calls.find((c) => c[0] === name);
+    const workerFor = (name: string): unknown[] | undefined =>
+      (Worker as unknown as Mock).mock.calls.find((c) => c[0] === name);
     const processorFor = (name: string): ((job: { data: unknown }) => Promise<void>) | undefined =>
       workerFor(name)?.[1] as ((job: { data: unknown }) => Promise<void>) | undefined;
 
@@ -113,11 +173,14 @@ describe('StrideForward hook', () => {
       await queue.add({}, { enterpriseId: 'proj-a', jobId: 'same' });
       await queue.add({}, { enterpriseId: 'proj-b', jobId: 'same' });
       await queue.add({}, { enterpriseId: '6f1c1f2e-9a4b-4f6a', jobId: '12345' });
-      const ids = (queueRegistry.get('sf-test-ids') as unknown as { add: Mock }).add.mock.calls.map((c) => (c[2] as { jobId?: string }).jobId);
+      const ids = (queueRegistry.get('sf-test-ids') as unknown as { add: Mock }).add.mock.calls.map(
+        (c) => (c[2] as { jobId?: string }).jobId
+      );
       expect(ids).toEqual(['proj-a__same', 'proj-b__same', '6f1c1f2e-9a4b-4f6a__12345']);
       // The real BullMQ (not the test mock) validates each generated id.
       const real = await vi.importActual<typeof BullMQ>('bullmq');
-      const validate = (real.Job.prototype as unknown as { validateOptions: (this: unknown, d: unknown) => void }).validateOptions;
+      const validate = (real.Job.prototype as unknown as { validateOptions: (this: unknown, d: unknown) => void })
+        .validateOptions;
       for (const jobId of ids) {
         expect(() => validate.call({ opts: { jobId } }, { data: '{}' })).not.toThrow();
       }
@@ -141,15 +204,24 @@ describe('StrideForward hook', () => {
     test('a platform queue carries no enterprise and may repeat; a tenant queue may not repeat', async () => {
       await host.jobs.register('sf-test-sweep', { scope: 'platform', everyMs: 5000 }, async () => undefined);
       const q = queueRegistry.get('sf-test-sweep') as unknown as { upsertJobScheduler: Mock };
-      expect(q.upsertJobScheduler).toHaveBeenCalledWith('sf-test-sweep:every', { every: 5000 }, expect.objectContaining({ name: 'sf-test-sweep' }));
-      await expect(host.jobs.register('sf-test-bad-repeat', { scope: 'tenant', everyMs: 5000 } as never, async () => undefined)).rejects.toThrow(/platform/);
+      expect(q.upsertJobScheduler).toHaveBeenCalledWith(
+        'sf-test-sweep:every',
+        { every: 5000 },
+        expect.objectContaining({ name: 'sf-test-sweep' })
+      );
+      await expect(
+        host.jobs.register('sf-test-bad-repeat', { scope: 'tenant', everyMs: 5000 } as never, async () => undefined)
+      ).rejects.toThrow(/platform/);
     });
 
     test('workers get Medplum`s BullMQ settings (concurrency, job retention) and its global concurrency', async () => {
       await host.jobs.register('sf-test-config', { scope: 'platform' }, async () => undefined);
       const options = workerFor('sf-test-config')?.[2] as Record<string, unknown>;
       expect(options).toMatchObject({ concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } });
-      const q = queueRegistry.get('sf-test-config') as unknown as { removeGlobalConcurrency: Mock; setGlobalConcurrency: Mock };
+      const q = queueRegistry.get('sf-test-config') as unknown as {
+        removeGlobalConcurrency: Mock;
+        setGlobalConcurrency: Mock;
+      };
       expect(q.removeGlobalConcurrency.mock.calls.length + q.setGlobalConcurrency.mock.calls.length).toBeGreaterThan(0);
     });
 
@@ -158,12 +230,20 @@ describe('StrideForward hook', () => {
       await expect(installScheduler(failing as never, 'sf-test-x', 5000)).rejects.toThrow('redis down');
       const ok = { upsertJobScheduler: vi.fn().mockResolvedValue(undefined) };
       await installScheduler(ok as never, 'sf-test-x', 5000);
-      expect(ok.upsertJobScheduler).toHaveBeenCalledWith('sf-test-x:every', { every: 5000 }, { name: 'sf-test-x', data: {} });
+      expect(ok.upsertJobScheduler).toHaveBeenCalledWith(
+        'sf-test-x:every',
+        { every: 5000 },
+        { name: 'sf-test-x', data: {} }
+      );
     });
 
     test('queue names are namespaced and registered once', async () => {
-      await expect(host.jobs.register('not-namespaced', { scope: 'platform' }, async () => undefined)).rejects.toThrow(/sf-/);
-      await expect(host.jobs.register('sf-test-dispatch', { scope: 'tenant' }, async () => undefined)).rejects.toThrow(/already/);
+      await expect(host.jobs.register('not-namespaced', { scope: 'platform' }, async () => undefined)).rejects.toThrow(
+        /sf-/
+      );
+      await expect(host.jobs.register('sf-test-dispatch', { scope: 'tenant' }, async () => undefined)).rejects.toThrow(
+        /already/
+      );
     });
   });
 });
