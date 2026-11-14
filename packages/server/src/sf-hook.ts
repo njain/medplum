@@ -1,13 +1,5 @@
+// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-// StrideForward registration hook: the only StrideForward code in this fork.
-//
-// StrideForward's server modules live in their own repository and are added to the image at build time. They
-// never import Medplum internals directly: this hook hands them a small host interface (an authenticated
-// router, the request context, transaction-safe SQL access, the database pool and the logger lookup). Upgrading
-// Medplum therefore conflicts, at most, here.
-//
-// SF_MODULES is a comma-separated list of module entry files (absolute paths). Each exports
-// `register(host: StrideForwardHost): Promise<void> | void`. With SF_MODULES unset this hook does nothing.
 import * as medplumCore from '@medplum/core';
 import type { Project, ResourceType } from '@medplum/fhirtypes';
 import { Queue, UnrecoverableError, Worker } from 'bullmq';
@@ -51,6 +43,24 @@ export interface StrideForwardQueue {
 export type StrideForwardJobScope =
   { readonly scope: 'tenant' } | { readonly scope: 'platform'; readonly everyMs?: number };
 
+/**
+ * One run of a StrideForward job, for observers (trust-layer brief §7f item 2: job health). Never the job's data or the
+ * error's message, either of which may name a patient: only the error's class name.
+ */
+export interface StrideForwardJobRun {
+  readonly queue: string;
+  /** Tenant jobs only. */
+  readonly enterpriseId?: string;
+  readonly startedAt: Date;
+  readonly finishedAt: Date;
+  readonly outcome: 'completed' | 'failed';
+  /** 1 for the first try. */
+  readonly attempt: number;
+  /** No retry follows: completed, out of attempts, or not retryable (UnrecoverableError). */
+  readonly final: boolean;
+  readonly errorName?: string;
+}
+
 export interface StrideForwardJobs {
   /**
    * Registers a queue named `sf-<module>-<job>` on Medplum's BullMQ connection and in its queue registry (closed on
@@ -64,6 +74,11 @@ export interface StrideForwardJobs {
     scope: StrideForwardJobScope,
     handler: (job: StrideForwardJob) => Promise<void>
   ): Promise<StrideForwardQueue>;
+  /**
+   * Calls `listener` after every StrideForward job this node's workers run, completed or failed. A listener that throws
+   * or rejects is logged (its error class only) and never changes the job's outcome; the job does not wait for it.
+   */
+  observe(listener: (run: StrideForwardJobRun) => void | Promise<void>): void;
 }
 
 export interface StrideForwardHost {
@@ -135,7 +150,24 @@ export async function installScheduler(
   await queue.upsertJobScheduler(`${name}:every`, { every: everyMs }, { name, data: {} });
 }
 
+const jobObservers: ((run: StrideForwardJobRun) => void | Promise<void>)[] = [];
+
+function notifyObservers(run: StrideForwardJobRun): void {
+  for (const listener of jobObservers) {
+    const report = (err: unknown): void =>
+      getLogger().warn('StrideForward job observer failed', { queue: run.queue, errorType: (err as Error)?.name });
+    try {
+      Promise.resolve(listener(run)).catch(report);
+    } catch (err) {
+      report(err);
+    }
+  }
+}
+
 const jobs: StrideForwardJobs = {
+  observe(listener) {
+    jobObservers.push(listener);
+  },
   async register(name, scope, handler) {
     if (!QUEUE_NAME.test(name)) {
       throw new Error(`StrideForward queue names must look like sf-<module>-<job>: ${name}`);
@@ -160,18 +192,44 @@ const jobs: StrideForwardJobs = {
     const worker = workerEnabled
       ? new Worker(
           name,
-          async (job: { data: unknown }) => {
+          async (job: { data: unknown; attemptsMade?: number; opts?: { attempts?: number } }) => {
+            const startedAt = new Date();
+            const attempt = (job.attemptsMade ?? 0) + 1;
             const envelope = (job.data ?? {}) as { enterpriseId?: unknown; data?: unknown };
-            const data = (envelope.data ?? {}) as Record<string, unknown>;
-            if (scope.scope === 'tenant') {
-              if (typeof envelope.enterpriseId !== 'string' || !ENTERPRISE_ID.test(envelope.enterpriseId)) {
-                // Never retried: a job without its enterprise cannot be run in any tenant's context.
-                throw new UnrecoverableError('tenant job has no valid enterpriseId');
+            const enterpriseId =
+              scope.scope === 'tenant' &&
+              typeof envelope.enterpriseId === 'string' &&
+              ENTERPRISE_ID.test(envelope.enterpriseId)
+                ? envelope.enterpriseId
+                : undefined;
+            const base = { queue: name, ...(enterpriseId ? { enterpriseId } : {}), startedAt, attempt };
+            try {
+              const data = (envelope.data ?? {}) as Record<string, unknown>;
+              if (scope.scope === 'tenant') {
+                if (!enterpriseId) {
+                  // Never retried: a job without its enterprise cannot be run in any tenant's context.
+                  throw new UnrecoverableError('tenant job has no valid enterpriseId');
+                }
+                await handler({ enterpriseId, data });
+              } else {
+                await handler({ data });
               }
-              await handler({ enterpriseId: envelope.enterpriseId, data });
-            } else {
-              await handler({ data });
+            } catch (err) {
+              const unrecoverable = err instanceof UnrecoverableError;
+              let errorName = err instanceof Error ? err.name : 'Error';
+              if (unrecoverable) {
+                errorName = 'UnrecoverableError';
+              }
+              notifyObservers({
+                ...base,
+                finishedAt: new Date(),
+                outcome: 'failed',
+                final: unrecoverable || attempt >= (job.opts?.attempts ?? 1),
+                errorName,
+              });
+              throw err;
             }
+            notifyObservers({ ...base, finishedAt: new Date(), outcome: 'completed', final: true });
           },
           { ...queueOptions, ...bullmq }
         )

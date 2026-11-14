@@ -1,5 +1,5 @@
+// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-// StrideForward registration hook: the host additions modules rely on (first-module brief §6; plan item 1.9).
 import type { WithId } from '@medplum/core';
 import { isNotFound, OperationOutcomeError, Operator } from '@medplum/core';
 import type { Observation, Patient, Project } from '@medplum/fhirtypes';
@@ -239,6 +239,79 @@ describe('StrideForward hook', () => {
         { every: 5000 },
         { name: 'sf-test-x', data: {} }
       );
+    });
+
+    describe('observing job runs', () => {
+      type Run = Record<string, unknown>;
+      const runs: Run[] = [];
+      beforeAll(() => {
+        host.jobs.observe((run) => {
+          runs.push(run as unknown as Run);
+        });
+      });
+
+      test('an observer gets one record per run: queue, enterprise, times, outcome and attempt, never the job data', async () => {
+        await host.jobs.register('sf-test-observe-ok', { scope: 'tenant' }, async () => undefined);
+        runs.length = 0;
+        const before = Date.now();
+        await processorFor('sf-test-observe-ok')?.({
+          data: { enterpriseId: 'proj-a', data: { patient: 'Patient/secret' } },
+          attemptsMade: 0,
+          opts: { attempts: 3 },
+        } as never);
+        expect(runs).toHaveLength(1);
+        const run = runs[0];
+        expect(Object.keys(run).sort()).toEqual(
+          ['attempt', 'enterpriseId', 'final', 'finishedAt', 'outcome', 'queue', 'startedAt'].sort()
+        );
+        expect(run).toMatchObject({
+          queue: 'sf-test-observe-ok',
+          enterpriseId: 'proj-a',
+          outcome: 'completed',
+          attempt: 1,
+          final: true,
+        });
+        expect((run.startedAt as Date).getTime()).toBeGreaterThanOrEqual(before);
+        expect((run.finishedAt as Date).getTime()).toBeGreaterThanOrEqual((run.startedAt as Date).getTime());
+        expect(JSON.stringify(run)).not.toContain('secret');
+      });
+
+      test('a failed run carries only the error`s class name; it is final when no retry is left or it cannot be retried', async () => {
+        await host.jobs.register('sf-test-observe-fail', { scope: 'platform' }, async () => {
+          throw new TypeError('Patient/secret broke');
+        });
+        runs.length = 0;
+        const run = processorFor('sf-test-observe-fail');
+        await expect(run?.({ data: { data: {} }, attemptsMade: 0, opts: { attempts: 3 } } as never)).rejects.toThrow(
+          TypeError
+        );
+        await expect(run?.({ data: { data: {} }, attemptsMade: 2, opts: { attempts: 3 } } as never)).rejects.toThrow(
+          TypeError
+        );
+        expect(runs.map((r) => [r.outcome, r.attempt, r.final, r.errorName, r.enterpriseId])).toEqual([
+          ['failed', 1, false, 'TypeError', undefined],
+          ['failed', 3, true, 'TypeError', undefined],
+        ]);
+        expect(JSON.stringify(runs)).not.toContain('secret');
+        runs.length = 0;
+        await expect(
+          processorFor('sf-test-observe-ok')?.({ data: { data: {} }, attemptsMade: 0, opts: { attempts: 3 } } as never)
+        ).rejects.toThrow(/enterpriseId/);
+        expect(runs.map((r) => [r.outcome, r.final, r.errorName])).toEqual([['failed', true, 'UnrecoverableError']]);
+      });
+
+      test('an observer that throws or rejects never changes the job`s outcome', async () => {
+        host.jobs.observe(() => {
+          throw new Error('observer broke');
+        });
+        host.jobs.observe(async () => {
+          throw new Error('observer rejected');
+        });
+        await host.jobs.register('sf-test-observe-safe', { scope: 'platform' }, async () => undefined);
+        await expect(
+          processorFor('sf-test-observe-safe')?.({ data: { data: {} }, attemptsMade: 0, opts: {} } as never)
+        ).resolves.toBeUndefined();
+      });
     });
 
     test('queue names are namespaced and registered once', async () => {
