@@ -300,6 +300,21 @@ describe('StrideForward hook', () => {
         expect(runs.map((r) => [r.outcome, r.final, r.errorName])).toEqual([['failed', true, 'UnrecoverableError']]);
       });
 
+      test('an error named UnrecoverableError from another copy of BullMQ is final too, as BullMQ treats it', async () => {
+        await host.jobs.register('sf-test-observe-named', { scope: 'platform' }, async () => {
+          throw Object.assign(new Error('elsewhere'), { name: 'UnrecoverableError' });
+        });
+        runs.length = 0;
+        await expect(
+          processorFor('sf-test-observe-named')?.({
+            data: { data: {} },
+            attemptsMade: 0,
+            opts: { attempts: 5 },
+          } as never)
+        ).rejects.toThrow('elsewhere');
+        expect(runs.map((r) => [r.outcome, r.final, r.errorName])).toEqual([['failed', true, 'UnrecoverableError']]);
+      });
+
       test('an observer that throws or rejects never changes the job`s outcome', async () => {
         host.jobs.observe(() => {
           throw new Error('observer broke');

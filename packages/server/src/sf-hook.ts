@@ -215,7 +215,9 @@ const jobs: StrideForwardJobs = {
                 await handler({ data });
               }
             } catch (err) {
-              const unrecoverable = err instanceof UnrecoverableError;
+              // As BullMQ decides: the class, or any error so named (another copy of the package).
+              const unrecoverable =
+                err instanceof UnrecoverableError || (err instanceof Error && err.name === 'UnrecoverableError');
               let errorName = err instanceof Error ? err.name : 'Error';
               if (unrecoverable) {
                 errorName = 'UnrecoverableError';
